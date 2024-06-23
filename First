@@ -1,1 +1,358 @@
+// Backend (Rust)
 
+use actix_web::{web, App, HttpServer, HttpResponse, Responder, Error};
+use actix_web_actors::ws;
+use actix::{Actor, StreamHandler, Addr, AsyncContext, Message, Handler};
+use mongodb::{Client, options::ClientOptions};
+use mongodb::bson::{doc, Document, oid::ObjectId};
+use futures::stream::TryStreamExt;
+use serde::{Serialize, Deserialize};
+use log::{error, info, warn, debug};
+use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
+use bcrypt::{hash, verify};
+use chrono::{Utc, Duration};
+use std::sync::{Mutex, Arc};
+use std::collections::{HashMap, HashSet};
+use dotenv::dotenv;
+use std::env;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct User {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<ObjectId>,
+    username: String,
+    #[serde(skip_serializing)]
+    password_hash: String,
+    role: UserRole,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+enum UserRole {
+    ProjectManager,
+    RemodelManager,
+    RegionalExecutive,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    role: UserRole,
+    exp: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChangeOrder {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<ObjectId>,
+    description: String,
+    estimated_cost: f64,
+    status: ApprovalStatus,
+    chat_log: Vec<ChatMessage>,
+    subscribers: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    user: String,
+    message: String,
+    timestamp: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum ApprovalStatus {
+    Pending,
+    ApprovedByProjectManager,
+    ApprovedByRemodelManager,
+    ApprovedByRegionalExecutive,
+    FullyApproved,
+}
+
+struct AppState {
+    db: Client,
+    sessions: Arc<Mutex<HashMap<String, Addr<WsSession>>>>,
+}
+
+struct WsSession {
+    id: String,
+    role: UserRole,
+    app_state: web::Data<AppState>,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+struct WsMessage(String);
+
+impl Actor for WsSession {
+    type Context = ws::WebsocketContext<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        self.subscribe_to_relevant_changes(ctx);
+    }
+}
+
+impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
+    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
+        match msg {
+            Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
+            Ok(ws::Message::Text(text)) => {
+                let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+                match message["action"].as_str() {
+                    Some("subscribe") => {
+                        if let Some(change_order_id) = message["changeOrderId"].as_str() {
+                            self.subscribe_to_change_order(change_order_id.to_string());
+                        }
+                    }
+                    Some("unsubscribe") => {
+                        if let Some(change_order_id) = message["changeOrderId"].as_str() {
+                            self.unsubscribe_from_change_order(change_order_id.to_string());
+                        }
+                    }
+                    Some("chat") => {
+                        if let (Some(change_order_id), Some(message_text)) = (message["changeOrderId"].as_str(), message["message"].as_str()) {
+                            self.add_chat_message(change_order_id.to_string(), message_text.to_string());
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
+            _ => (),
+        }
+    }
+}
+
+impl WsSession {
+    fn subscribe_to_relevant_changes(&self, ctx: &mut ws::WebsocketContext<Self>) {
+        ctx.run_interval(Duration::seconds(30).to_std().unwrap(), |act, ctx| {
+            ctx.ping(b"");
+        });
+    }
+
+    fn subscribe_to_change_order(&self, change_order_id: String) {
+        let collection = self.app_state.db.database("change_orders").collection("orders");
+        let update = doc! {
+            "$addToSet": {
+                "subscribers": self.id.clone()
+            }
+        };
+        let _result = collection.update_one(doc! { "_id": ObjectId::parse_str(&change_order_id).unwrap() }, update, None);
+    }
+
+    fn unsubscribe_from_change_order(&self, change_order_id: String) {
+        let collection = self.app_state.db.database("change_orders").collection("orders");
+        let update = doc! {
+            "$pull": {
+                "subscribers": self.id.clone()
+            }
+        };
+        let _result = collection.update_one(doc! { "_id": ObjectId::parse_str(&change_order_id).unwrap() }, update, None);
+    }
+
+    fn add_chat_message(&self, change_order_id: String, message: String) {
+        let collection = self.app_state.db.database("change_orders").collection("orders");
+        let chat_message = ChatMessage {
+            user: self.id.clone(),
+            message,
+            timestamp: Utc::now(),
+        };
+        let update = doc! {
+            "$push": {
+                "chat_log": mongodb::bson::to_bson(&chat_message).unwrap()
+            }
+        };
+        let _result = collection.update_one(doc! { "_id": ObjectId::parse_str(&change_order_id).unwrap() }, update, None);
+        
+        self.notify_subscribers(change_order_id, &chat_message);
+    }
+
+    fn notify_subscribers(&self, change_order_id: String, chat_message: &ChatMessage) {
+        let collection = self.app_state.db.database("change_orders").collection("orders");
+        if let Ok(Some(change_order)) = collection.find_one(doc! { "_id": ObjectId::parse_str(&change_order_id).unwrap() }, None).unwrap() {
+            let change_order: ChangeOrder = mongodb::bson::from_document(change_order).unwrap();
+            let notification = serde_json::json!({
+                "type": "chat",
+                "changeOrderId": change_order_id,
+                "message": chat_message
+            });
+            for subscriber in change_order.subscribers {
+                if let Some(addr) = self.app_state.sessions.lock().unwrap().get(&subscriber) {
+                    addr.do_send(WsMessage(serde_json::to_string(&notification).unwrap()));
+                }
+            }
+        }
+    }
+}
+
+impl Handler<WsMessage> for WsSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: WsMessage, ctx: &mut Self::Context) {
+        ctx.text(msg.0);
+    }
+}
+
+async fn ws_route(
+    req: web::HttpRequest,
+    stream: web::Payload,
+    app_state: web::Data<AppState>,
+    token: web::Header<String>,
+) -> Result<HttpResponse, Error> {
+    let claims = match decode::<Claims>(&token, &DecodingKey::from_secret(env::var("JWT_SECRET").unwrap().as_ref()), &Validation::default()) {
+        Ok(token_data) => token_data.claims,
+        Err(_) => return Ok(HttpResponse::Unauthorized().body("Invalid token")),
+    };
+
+    let session = WsSession {
+        id: claims.sub.clone(),
+        role: claims.role,
+        app_state: app_state.clone(),
+    };
+
+    let (addr, resp) = ws::WsResponseBuilder::new(session, &req, stream).start_with_addr()?;
+
+    app_state.sessions.lock().unwrap().insert(claims.sub, addr);
+
+    Ok(resp)
+}
+
+async fn register_user(
+    app_state: web::Data<AppState>,
+    user_info: web::Json<User>,
+) -> impl Responder {
+    let collection = app_state.db.database("change_orders").collection("users");
+    let password_hash = match hash(&user_info.password_hash, 10) {
+        Ok(hash) => hash,
+        Err(_) => return HttpResponse::InternalServerError().body("Failed to hash password"),
+    };
+    let user = User {
+        id: None,
+        username: user_info.username.clone(),
+        password_hash,
+        role: user_info.role.clone(),
+    };
+    match collection.insert_one(user, None).await {
+        Ok(_) => HttpResponse::Ok().body("User registered successfully"),
+        Err(_) => HttpResponse::InternalServerError().body("Failed to register user"),
+    }
+}
+
+async fn login(
+    app_state: web::Data<AppState>,
+    user_info: web::Json<User>,
+) -> impl Responder {
+    let collection = app_state.db.database("change_orders").collection("users");
+    let user: User = match collection.find_one(doc! { "username": &user_info.username }, None).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return HttpResponse::Unauthorized().body("User not found"),
+        Err(_) => return HttpResponse::InternalServerError().body("Database error"),
+    };
+    
+    if verify(&user_info.password_hash, &user.password_hash).unwrap_or(false) {
+        let expiration = Utc::now()
+            .checked_add_signed(Duration::hours(2))
+            .expect("valid timestamp")
+            .timestamp();
+
+        let claims = Claims {
+            sub: user.username,
+            role: user.role,
+            exp: expiration as usize,
+        };
+
+        match encode(&Header::default(), &claims, &EncodingKey::from_secret(env::var("JWT_SECRET").unwrap().as_ref())) {
+            Ok(token) => HttpResponse::Ok().body(token),
+            Err(_) => HttpResponse::InternalServerError().body("Failed to generate token"),
+        }
+    } else {
+        HttpResponse::Unauthorized().body("Invalid password")
+    }
+}
+
+async fn submit_change_order(
+    app_state: web::Data<AppState>,
+    change_order: web::Json<ChangeOrder>,
+    token: web::Header<String>,
+) -> impl Responder {
+    let claims = match decode::<Claims>(&token, &DecodingKey::from_secret(env::var("JWT_SECRET").unwrap().as_ref()), &Validation::default()) {
+        Ok(token_data) => token_data.claims,
+        Err(_) => return HttpResponse::Unauthorized().body("Invalid token"),
+    };
+
+    if claims.role != UserRole::ProjectManager {
+        return HttpResponse::Forbidden().body("Only Project Managers can submit change orders");
+    }
+
+    let collection = app_state.db.database("change_orders").collection("orders");
+    match collection.insert_one(change_order.into_inner(), None).await {
+        Ok(result) => {
+            let notification = serde_json::json!({
+                "type": "new_change_order",
+                "changeOrderId": result.inserted_id.to_string(),
+            });
+            notify_all_users(&app_state, &serde_json::to_string(&notification).unwrap());
+            HttpResponse::Ok().body(format!("Change order submitted with ID: {:?}", result.inserted_id))
+        },
+        Err(_) => HttpResponse::InternalServerError().body("Failed to submit change order"),
+    }
+}
+
+async fn process_approvals(
+    app_state: web::Data<AppState>,
+    token: web::Header<String>,
+) -> impl Responder {
+    let claims = match decode::<Claims>(&token, &DecodingKey::from_secret(env::var("JWT_SECRET").unwrap().as_ref()), &Validation::default()) {
+        Ok(token_data) => token_data.claims,
+        Err(_) => return HttpResponse::Unauthorized().body("Invalid token"),
+    };
+
+    let collection = app_state.db.database("change_orders").collection("orders");
+    let mut cursor = match collection.find(None, None).await {
+        Ok(cursor) => cursor,
+        Err(_) => return HttpResponse::InternalServerError().body("Database error"),
+    };
+
+    let mut updated_count = 0;
+    while let Ok(Some(result)) = cursor.try_next().await {
+        let mut change_order: ChangeOrder = mongodb::bson::from_document(result).unwrap();
+        let new_status = match (change_order.status.clone(), claims.role.clone()) {
+            (ApprovalStatus::Pending, UserRole::ProjectManager) => Some(ApprovalStatus::ApprovedByProjectManager),
+            (ApprovalStatus::ApprovedByProjectManager, UserRole::RemodelManager) if change_order.estimated_cost <= 14000.0 => Some(ApprovalStatus::FullyApproved),
+            (ApprovalStatus::ApprovedByProjectManager, UserRole::RemodelManager) => Some(ApprovalStatus::ApprovedByRemodelManager),
+            (ApprovalStatus::ApprovedByRemodelManager, UserRole::RegionalExecutive) => Some(ApprovalStatus::FullyApproved),
+            _ => None,
+        };
+
+        if let Some(new_status) = new_status {
+            change_order.status = new_status.clone();
+            let update_doc = doc! {
+                "$set": {
+                    "status": mongodb::bson::to_bson(&change_order.status).unwrap()
+                }
+            };
+            if let Ok(update_result) = collection.update_one(doc! { "_id": change_order.id }, update_doc, None).await {
+                if update_result.modified_count > 0 {
+                    updated_count += 1;
+                    let notification = serde_json::json!({
+                        "type": "status_change",
+                        "changeOrderId": change_order.id.unwrap().to_string(),
+                        "newStatus": new_status,
+                    });
+                    notify_subscribers(&app_state, &change_order.id.unwrap().to_string(), &serde_json::to_string(&notification).unwrap());
+                }
+            }
+        }
+    }
+
+    HttpResponse::Ok().body(format!("Processed approvals. Updated {} change orders.", updated_count))
+}
+
+async fn display_status(
+    app_state: web::Data<AppState>,
+    token: web::Header<String>,
+) -> impl Responder {
+    let _claims = match decode::<Claims>(&token, &DecodingKey::from_secret(env::var("JWT_SECRET").unwrap().as_ref()), &Validation::default()) {
+        Ok(token_data) => token_data.claims,
+        Err(_) => return HttpResponse::Unauthorized().body("Invalid token"),
+    };
+
+    let collection = app_state.db.database("change_orders")
